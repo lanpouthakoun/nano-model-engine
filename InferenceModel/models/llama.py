@@ -5,9 +5,9 @@ Implementation of LLama with Custom Attnetion Mechanism
 import torch
 from torch import nn
 from transformers import LlamaConfig
-from layers.layernorm import LlamaRMSNorm
-from layers.attention import Attention
-from layers.rotary_embedding import get_rope
+from InferenceModel.models.layers.layernorm import LlamaRMSNorm
+from InferenceModel.models.layers.attention import Attention
+from InferenceModel.models.layers.rotary_embedding import get_rope
 
 class LLamaAttention(nn.Module):
     def __init__(
