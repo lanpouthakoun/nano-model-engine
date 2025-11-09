@@ -65,7 +65,7 @@ class Attention(nn.Module):
         Returns:
             output: (total_tokens, num_heads, head_dim)
         """
-        context = get_context() # make a context tool
+        # context = get_context() # make a context tool
         k_cache, v_cache = self.k_cache, self.v_cache
         
         # Store new KV pairs in cache
@@ -73,14 +73,15 @@ class Attention(nn.Module):
         #     # only store the projected kv_values
         #     store_kvcache(key, value, k_cache, v_cache, context.slot_mapping)
         
-        if context.is_prefill:
-            output = self._prefill_attention(query, key, value, context)
-        else:
-            output = self._decode_attention(query, k_cache, v_cache, context)
+        # if context.is_prefill:
+        #     output = self._prefill_attention(query, key, value, context)
+        # else:
+        #     output = self._decode_attention(query, k_cache, v_cache, context)
+        output = self._prefill_attention(query, key, value)
         
         return output
     
-    def _prefill_attention(self, query, key, value, context):
+    def _prefill_attention(self, query, key, value, context = None):
         """
         Prefill attention: compute attention over prompt tokens.
         Handles variable-length sequences using cu_seqlens.
@@ -88,15 +89,19 @@ class Attention(nn.Module):
         # query: (total_tokens, num_heads, head_dim) -> need batch dimension
         
         # Get cumulative sequence lengths to separate sequences
-        cu_seqlens_q = context.cu_seqlens_q.cpu().tolist()
-        cu_seqlens_k = context.cu_seqlens_k.cpu().tolist()
-        
-        num_seqs = len(cu_seqlens_q) - 1
-        
-        # If prefix cache is used, read from cache instead
-        if context.block_tables is not None:
-            key = self._read_from_cache(self.k_cache, context.block_tables, cu_seqlens_k)
-            value = self._read_from_cache(self.v_cache, context.block_tables, cu_seqlens_k)
+        if context:
+            cu_seqlens_q = context.cu_seqlens_q.cpu().tolist()
+            cu_seqlens_k = context.cu_seqlens_k.cpu().tolist()
+            
+            num_seqs = len(cu_seqlens_q) - 1
+            
+            # If prefix cache is used, read from cache instead
+            if context.block_tables is not None:
+                key = self._read_from_cache(self.k_cache, context.block_tables, cu_seqlens_k)
+                value = self._read_from_cache(self.v_cache, context.block_tables, cu_seqlens_k)
+        else:
+            cu_seqlens_q = torch.tensor([0, query.shape[1]])
+            cu_seqlens_k = torch.tensor([0, query.shape[1]])
         
         if self.num_kv_heads < self.num_heads:
             key = self._repeat_kv(key, self.num_heads // self.num_kv_heads)

@@ -16,9 +16,17 @@ class KVCacheManager(ABC):
     @abstractmethod
     def free(self):
         pass
-    
+
     @abstractmethod
     def can_allocate(self):
         pass
+
+    @abstractmethod
+    def can_run(self):
+        pass
+
+    @abstractmethod
+    def organize(self):
+        return self.free_block_queue
 
 

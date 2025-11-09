@@ -7,77 +7,61 @@ from torch import nn
 from transformers import LlamaConfig
 from InferenceModel.models.layers.layernorm import LlamaRMSNorm
 from InferenceModel.models.layers.attention import Attention
-from InferenceModel.models.layers.rotary_embedding import get_rope
+from InferenceModel.models.layers.simple_attention import SimpleAttention
+from typing import Optional, Union
+from InferenceModel.models.layers.rotary_embedding import RotaryEmbedding, apply_rotary_emb
 
-class LLamaAttention(nn.Module):
-    def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            max_position: int = 4096 * 32,
-            attention_bias: bool= True,
-            head_dim: int | None = None,
-            layer_idx: int | None = None,
-            rope_theta: float = 10000,
-            rope_scaling: tuple | None = None,):
+class LlamaAttention(nn.Module):
+
+    def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.num_kv_heads = num_kv_heads
-        self.max_position = max_position
+        self.config = config
         self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
 
         self.q_proj = nn.Linear(
-            self.hidden_size, 
-            self.num_heads * self.head_dim, 
-            bias=attention_bias
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
-    
         self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=attention_bias,
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
-
         self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=attention_bias,
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
-
         self.o_proj = nn.Linear(
-            self.hidden_size, self.hidden_size, bias=attention_bias
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            self.num_kv_heads,
+        self.attn = SimpleAttention(num_heads = config.num_attention_heads, head_dim = self.head_dim,
+                                    scale = self.scaling, num_kv_heads = config.num_key_value_heads)
 
-        )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
-    def forward(self, positions, hidden_states):
-        """
-        Need to take care of the cache manager first before i can do this
-        """
-        k,v,q = self.k_proj(hidden_states), self.v_proj(hidden_states), self.q_proj(hidden_states)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        q,k = self.rotary_emb(positions, q, k)
-        
-        o = self.attn(q,k,v)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        output = self.o_proj(o.flatten(1,-1))
-        return output
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_emb(query_states, key_states, cos, sin)
+
+        attn_output, attn_weights = self.attn(
+            query_states,
+            key_states,
+            value_states,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
 
 class LLamaMLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, bias: int):
@@ -101,10 +85,10 @@ class LLamaMLP(nn.Module):
         )
 
 class LLamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LLamaAttention(config = config, layer_idx = layer_idx)
+        self.self_attn = LlamaAttention(config)
 
         self.mlp = LLamaMLP(config.hidden_size, config.intermediate_size, config.mlp_bias)
 
@@ -115,20 +99,32 @@ class LLamaDecoderLayer(nn.Module):
     
     def forward(
         self,
-        positions: torch.Tensor,
+        position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+        attention
     ) -> tuple[torch.Tensor, torch.Tensor]:
         
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
 
-        if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 class LlamaModel(nn.Module):
     
@@ -146,11 +142,10 @@ class LlamaModel(nn.Module):
             self, input_ids: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states = layer(positions, hidden_states)
         
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
@@ -175,5 +170,3 @@ class LLamaForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
     
-    def load_model(self, model):
-        pass

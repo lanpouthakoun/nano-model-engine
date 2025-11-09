@@ -19,13 +19,14 @@ class Scheduler:
 
     def is_finished(self):
         return len(self.waiting) == 0 and len(self.running) == 0
-    
+
     def schedule(self):
         """
         This function decides what to run at this specific iteration, it decides when to allocate requests (move from waiting to running)
         """
         num_requests = 0
         resulting_requests = []
+        # need an organize function for RADIX
 
         while self.waiting and num_requests < self.max_batch_size:
             request = self.waiting[0]
