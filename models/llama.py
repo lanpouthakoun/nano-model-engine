@@ -7,6 +7,7 @@ from torch import nn
 from transformers import LlamaConfig
 from layers.layernorm import LlamaRMSNorm
 from layers.attention import Attention
+from layers.rotary_embedding import get_rope
 
 class LLamaAttention(nn.Module):
     def __init__(
@@ -17,7 +18,9 @@ class LLamaAttention(nn.Module):
             max_position: int = 4096 * 32,
             attention_bias: bool= True,
             head_dim: int | None = None,
-            layer_idx: int | None = None):
+            layer_idx: int | None = None,
+            rope_theta: float = 10000,
+            rope_scaling: tuple | None = None,):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -52,7 +55,7 @@ class LLamaAttention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
-            
+
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -75,9 +78,6 @@ class LLamaAttention(nn.Module):
 
         output = self.o_proj(o.flatten(1,-1))
         return output
-
-
-
 
 class LLamaMLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, bias: int):
