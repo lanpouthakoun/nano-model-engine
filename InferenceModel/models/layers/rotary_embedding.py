@@ -38,31 +38,43 @@ class RotaryEmbedding(nn.Module):
 
     def __init__(
         self,
-        head_size: int,
-        rotary_dim: int,
-        base: float,
+        config
     ) -> None:
         super().__init__()
-        self.head_size = head_size
-        self.rotary_dim = rotary_dim
-        
-        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        print(config)
+
+        base = config.rope_theta
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+
+        # Compute the inverse frequencies
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(dtype=torch.float) / dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = inv_freq
+
+        
 
     def forward(
         self,
-        positions: torch.Tensor,
+        x,
+        position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(positions.shape[0], -1, 1)
-        position_ids_expanded = positions[:, None, :].float()
-        
-        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
-        
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
-        
-        return cos, sin
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 
