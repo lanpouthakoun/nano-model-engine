@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 from layers.layernorm import LlamaRMSNorm
+from layers.attention import Attention
 
 class LLamaAttention(nn.Module):
     def __init__(
@@ -14,9 +15,66 @@ class LLamaAttention(nn.Module):
             num_heads: int,
             num_kv_heads: int,
             max_position: int = 4096 * 32,
+            attention_bias: bool= True,
             head_dim: int | None = None,
-    ):
+            layer_idx: int | None = None):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_kv_heads = num_kv_heads
+        self.max_position = max_position
+        self.layer_idx = layer_idx
+
+        self.q_proj = nn.Linear(
+            self.hidden_size, 
+            self.num_heads * self.head_dim, 
+            bias=attention_bias
+        )
+    
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=attention_bias,
+        )
+
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=attention_bias,
+        )
+
+        self.o_proj = nn.Linear(
+            self.hidden_size, self.hidden_size, bias=attention_bias
+        )
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            self.num_kv_heads,
+            
+        )
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+        )
+    def forward(self, positions, hidden_states):
+        """
+        Need to take care of the cache manager first before i can do this
+        """
+        k,v,q = self.k_proj(hidden_states), self.v_proj(hidden_states), self.q_proj(hidden_states)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        q,k = self.rotary_emb(positions, q, k)
+        
+        o = self.attn(q,k,v)
+
+        output = self.o_proj(o.flatten(1,-1))
+        return output
 
 
 
