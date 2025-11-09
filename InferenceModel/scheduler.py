@@ -1,9 +1,11 @@
 from collections import deque
+from request import Request
+from managers.pagedManager import PagedAttentionManager
 
 
 class Scheduler:
-    def __init__(self, cache_manager, max_batch_size, eos = None):
-        self.KVCacheManager = cache_manager
+    def __init__(self, cache_manager, max_batch_size, eos = None, block_size = 32):
+        self.KVCacheManager = PagedAttentionManager(block_size)
         self.waiting = deque()
         self.running = []
         self.max_batch_size = max_batch_size
@@ -22,7 +24,44 @@ class Scheduler:
         """
         This function decides what to run at this specific iteration, it decides when to allocate requests (move from waiting to running)
         """
-        pass
+        num_requests = 0
+        resulting_requests = []
+
+        while self.waiting and num_requests < self.max_batch_size:
+            request = self.waiting[0]
+            if not self.KVCacheManager.can_allocate(request):
+                break
+            num_requests += 1
+            self.KVCacheManager.allocate(request)
+            # check here if we can even process this request
+
+            request.set_status("RUNNING")
+            self.waiting.popleft()
+            self.running.append(request)
+            resulting_requests.append(request)
+        
+        if resulting_requests:
+            # this means we have things to prefill
+            return resulting_requests, True
+    
+        while self.running and num_requests < self.max_batch_size:
+            req = self.running.popleft()
+            while not self.KVCacheManager.can_run(req): #were in a queue, so we want the front one to run the most
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(req)
+                    break
+            else:
+                resulting_requests.append(req)
+                num_requests += 1
+
+        return resulting_requests, False
+    
+    def preempt(self, req: Request):
+        req.set_status() = "WAITING"
+        self.KVCacheManager.free(req)
+        self.waiting.appendleft(req)
 
     def postproc(self, requests, new_tokens):
         """
@@ -37,7 +76,3 @@ class Scheduler:
                 request.status = "FINISHED"
                 self.KVCacheManager.deallocate(request)
                 self.running.remove(request)
-
-
-    def preempt(self):
-        pass
