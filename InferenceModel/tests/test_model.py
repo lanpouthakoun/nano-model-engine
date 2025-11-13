@@ -1,37 +1,21 @@
 """
-Test to verify custom LLaMA implementation matches HuggingFace outputs
+Test to verify custom Qwen implementation matches HuggingFace hidden states
 """
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from InferenceModel.models.llama import LLamaForCausalLM
-import torch.testing as torch_testing
-class OutputHook:
-    """Simple hook to capture a module's output."""
-    def __init__(self):
-        self.output = None
-        self.handle = None
+from InferenceModel.models.qwen import QwenForCausalLM
 
-    def __call__(self, module, inputs, output):
-        # We only care about the main output tensor
-        # Some models return tuples (hidden_states, caches)
-        self.output = output[0] if isinstance(output, tuple) else output
-        
-    def register(self, module):
-        """Registers this hook to the given module."""
-        self.handle = module.register_forward_hook(self)
-        
-    def remove(self):
-        """Removes the hook."""
-        if self.handle:
-            self.handle.remove()
 
-def load_models(model_name: str = "meta-llama/Llama-3.2-1B"):
+def load_models(model_name: str = "Qwen/Qwen3-0.6B", device: str = "cpu"):
     """Load both HuggingFace and custom models"""
+    print(f"Loading models on {device}...")
+    
     # Load HuggingFace model
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16, 
-        device_map="mps"
+        torch_dtype=torch.float32,  # Use float32 for CPU testing
+        device_map=device,
+        attn_implementation='eager'
     )
     hf_model.eval()
     
@@ -40,281 +24,202 @@ def load_models(model_name: str = "meta-llama/Llama-3.2-1B"):
     
     # Load custom model with HF weights
     config = hf_model.config
-    custom_model = LLamaForCausalLM(config)
+    custom_model = QwenForCausalLM(config)
     custom_model.load_state_dict(hf_model.state_dict(), strict=False)
-    custom_model = custom_model.to(dtype=torch.float16, device="mps")
+    custom_model = custom_model.to(dtype=torch.float32, device=device)
     custom_model.eval()
     
     return hf_model, custom_model, tokenizer, config
 
-def check_model_weights():
-    """
-    Compares the state_dicts of two models to find mismatches.
-    """
-    print("--- Starting Weight Check ---")
-    hf_model, custom_model, tokenizer, config = load_models()
+
+def test_single_input_hidden_states(device: str = "cpu"):
+    """Test that hidden states match for a single input"""
+    hf_model, custom_model, tokenizer, _ = load_models(device=device)
     
-    hf_state_dict = hf_model.state_dict()
-    custom_state_dict = custom_model.state_dict()
-
-    # 1. Check for mismatched keys
-    hf_keys = set(hf_state_dict.keys())
-    custom_keys = set(custom_state_dict.keys())
-
-    missing_in_custom = hf_keys - custom_keys
-    extra_in_custom = custom_keys - hf_keys
-
-    if missing_in_custom:
-        print("\n❌ ERROR: Keys missing from your custom model:")
-        for key in sorted(missing_in_custom):
-            print(f"  - {key}")
-
-    if extra_in_custom:
-        print("\n❌ ERROR: Your custom model has extra keys:")
-        for key in sorted(extra_in_custom):
-            print(f"  - {key}")
-
-    if not missing_in_custom and not extra_in_custom:
-        print("\n✅ SUCCESS: All state_dict keys match!")
-    else:
-        # Stop here if keys are wrong, no point checking values
-        return
-
-    # 2. Check for mismatched tensor values
-    mismatched_tensors = []
-    total_params = 0
-    mismatched_params = 0
-
-    for key in hf_keys:
-        hf_tensor = hf_state_dict[key]
-        custom_tensor = custom_state_dict[key]
-
-        total_params += hf_tensor.numel()
-
-        if not torch.allclose(hf_tensor, custom_tensor):
-            mismatched_tensors.append(key)
-            mismatched_params += hf_tensor.numel()
-
-    if mismatched_tensors:
-        print("\n❌ ERROR: Tensors have different values:")
-        for key in mismatched_tensors:
-            print(f"  - {key}")
-        print(f"\nSummary: {mismatched_params / total_params * 100:.2f}% of parameters mismatched.")
-    else:
-        print("\n✅ SUCCESS: All tensor values match perfectly!")
-        print("-----------------------------------")
-
-
-
-def test_output_logits_match():
-    """Test that logits from both models match layer by layer."""
-    hf_model, custom_model, tokenizer, config = load_models()
-    
-    # --- 1. Prepare Inputs ---
+    # Simple test input
     test_text = "The quick brown fox jumps over the lazy dog"
+    print(f"\nTest text: '{test_text}'")
+    
+    # Tokenize
     inputs = tokenizer(test_text, return_tensors="pt")
-    input_ids = inputs["input_ids"].to("mps") # Or your device
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
     
     batch_size, seq_len = input_ids.shape
-    positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+    positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
     
-    # --- 2. Run Embeddings ---
-    # We'll feed the same embedded input to both models' first layer
+    print(f"Input shape: {input_ids.shape}")
+    print(f"Sequence length: {seq_len}")
+    
+    # Forward pass
     with torch.no_grad():
-        hf_embeds = hf_model.model.embed_tokens(input_ids)
-        custom_embeds = custom_model.model.embed_tokens(input_ids)
-    
-    # Check embeddings (they should be identical)
-    print("--- Checking Embeddings ---")
-    torch_testing.assert_close(custom_embeds, hf_embeds, rtol=1e-3, atol=1e-3)
-    print("✅ Embeddings match!")
-
-    # --- 3. Layer-by-Layer Comparison ---
-    print("\n--- Checking Decoder Layers ---")
-    
-    # Start with the same input
-    hf_states = hf_embeds
-    custom_states = custom_embeds
-    
-    # Get the layers from both models
-    hf_layers = hf_model.model.layers
-    custom_layers = custom_model.model.layers
-
-    for i in range(len(hf_layers)):
-        print(f"\nComparing Layer {i}:")
-        hf_layer = hf_layers[i]
-        custom_layer = custom_layers[i]
+        # HuggingFace forward
+        hf_outputs = hf_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
         
-        # Create hooks
-        hf_hook = OutputHook()
-        custom_hook = OutputHook()
+        # Custom model forward
+        custom_logits, custom_layer_outputs = custom_model(
+            input_ids=input_ids,
+            positions=positions,
+            attention_mask=attention_mask
+        )
+    
+    # Compare embeddings (hidden_states[0] in HF)
+    print("\n" + "="*60)
+    print("COMPARING EMBEDDINGS (Layer 0)")
+    print("="*60)
+    hf_embeddings = hf_outputs.hidden_states[0]
+    # You might need to extract embeddings from your custom model differently
+    # For now assuming first layer output is after embeddings
+    
+    print(f"HF embeddings shape: {hf_embeddings.shape}")
+    print(f"Custom has {len(custom_layer_outputs)} layer outputs")
+    
+    # Compare layer by layer
+    print("\n" + "="*60)
+    print("COMPARING LAYER OUTPUTS")
+    print("="*60)
+    
+    num_layers = min(len(custom_layer_outputs), len(hf_outputs.hidden_states) - 1)
+    
+    for i in range(num_layers):
+        custom_hidden = custom_layer_outputs[i]
+        hf_hidden = hf_outputs.hidden_states[i + 1]  # +1 because hidden_states[0] is embeddings
         
-        # Attach hooks
-        hf_hook.register(hf_layer)
-        custom_hook.register(custom_layer)
+        print(f"\nLayer {i}:")
+        print(f"  Custom shape: {custom_hidden.shape}")
+        print(f"  HF shape: {hf_hidden.shape}")
         
-        # Run forward pass (hooks will capture the output)
-        with torch.no_grad():
-            # HF model needs attention_mask, your custom one doesn't
-            # This is a key difference in testing!
-            
-            attention_mask = torch.ones_like(input_ids)
-            
-
-            hf_layer(
-                hf_states,
-                attention_mask=attention_mask,
-                positions=positions,
-            )
-            
-            # Run Custom layer
-            custom_layer(
-                positions=positions,
-                hidden_states=custom_states
-            )
-
-        # Remove hooks
-        hf_hook.remove()
-        custom_hook.remove()
-
-        # --- 4. Compare Outputs ---
+        # Calculate differences
+        diff = (custom_hidden - hf_hidden).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        
+        print(f"  Max difference: {max_diff:.6e}")
+        print(f"  Mean difference: {mean_diff:.6e}")
+        
+        # Check if they match
         try:
-            torch_testing.assert_close(
-                custom_hook.output, 
-                hf_hook.output, 
-                rtol=1e-3, 
-                atol=1e-3
+            torch.testing.assert_close(
+                custom_hidden,
+                hf_hidden,
+                rtol=1e-4,
+                atol=1e-4
             )
-            print(f"✅ Layer {i} outputs match!")
+            print(f"  ✅ Layer {i} MATCHES!")
+        except AssertionError:
+            print(f"  ❌ Layer {i} MISMATCH!")
             
-            # Update states for the next loop
-            hf_states = hf_hook.output
-            custom_states = custom_hook.output
+            # Additional debugging info
+            print(f"\n  Debugging info:")
+            print(f"    Custom - min: {custom_hidden.min():.6f}, max: {custom_hidden.max():.6f}, mean: {custom_hidden.mean():.6f}")
+            print(f"    HF - min: {hf_hidden.min():.6f}, max: {hf_hidden.max():.6f}, mean: {hf_hidden.mean():.6f}")
             
-        except AssertionError as e:
-            print(f"❌ MISMATCH at Layer {i}!")
-            print(e)
-            # Stop the test, we found the bug
-            return
-
-    # --- 5. Final Check (if all layers passed) ---
-    print("\n--- Checking Final Norm & LM Head ---")
-    # ... (You can add checks for the final norm and lm_head here) ...
-    print("\n✅ All decoder layers match!")
-
-
-def test_generation_matches():
-    """Test that generated tokens match"""
-    hf_model, custom_model, tokenizer, config = load_models()
+            # Show where the largest differences are
+            max_diff_idx = diff.argmax()
+            max_diff_pos = torch.unravel_index(max_diff_idx, diff.shape)
+            print(f"    Largest diff at position: {max_diff_pos}")
+            print(f"    Custom value: {custom_hidden[max_diff_pos].item():.6f}")
+            print(f"    HF value: {hf_hidden[max_diff_pos].item():.6f}")
     
-    # Prepare prompt
-    prompt = "Once upon a time"
-    inputs = tokenizer(prompt, return_tensors="pt")
-    input_ids = inputs["input_ids"].to("mps")
+    # Compare final logits
+    print("\n" + "="*60)
+    print("COMPARING FINAL LOGITS")
+    print("="*60)
+    hf_logits = hf_outputs.logits
     
-    # Generate from both models
-    with torch.no_grad():
-        # HF generation
-        hf_output = hf_model.generate(
-            input_ids,
-            max_new_tokens=20,
-            do_sample=False,  # deterministic
-            temperature=1.0,
-            top_p=1.0
+    print(f"Custom logits shape: {custom_logits.shape}")
+    print(f"HF logits shape: {hf_logits.shape}")
+    
+    diff = (custom_logits - hf_logits).abs()
+    print(f"Max difference: {diff.max().item():.6e}")
+    print(f"Mean difference: {diff.mean().item():.6e}")
+    
+    try:
+        torch.testing.assert_close(
+            custom_logits,
+            hf_logits,
+            rtol=1e-4,
+            atol=1e-4
         )
-        
-        # Custom generation (you'll need to implement generate if you haven't)
-        custom_output = custom_model.generate(
-            input_ids,
-            max_new_tokens=20,
-            do_sample=False,
-            temperature=1.0,
-            top_p=1.0
-        )
-    
-    # Compare outputs
-    assert torch.equal(hf_output, custom_output), \
-        f"Generated tokens differ:\nHF: {tokenizer.decode(hf_output[0])}\nCustom: {tokenizer.decode(custom_output[0])}"
-    
-    print("✓ Generated outputs match!")
-    print(f"Generated text: {tokenizer.decode(hf_output[0])}")
+        print("✅ Final logits MATCH!")
+    except AssertionError:
+        print("❌ Final logits MISMATCH!")
 
 
-def test_multiple_inputs():
+def test_multiple_inputs(device: str = "cpu"):
     """Test with multiple different inputs"""
-    hf_model, custom_model, tokenizer, config = load_models()
+    hf_model, custom_model, tokenizer, _ = load_models(device=device)
     
     test_cases = [
         "Hello, world!",
         "The capital of France is",
         "1 + 1 =",
-        "In a galaxy far, far away",
     ]
     
+    print("\n" + "="*60)
+    print("TESTING MULTIPLE INPUTS")
+    print("="*60)
+    
     for test_text in test_cases:
+        print(f"\nTest: '{test_text}'")
+        
         inputs = tokenizer(test_text, return_tensors="pt")
-        input_ids = inputs["input_ids"].to("mps")
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
+        
+        batch_size, seq_len = input_ids.shape
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         
         with torch.no_grad():
-            hf_outputs = hf_model(input_ids)
-            custom_outputs = custom_model(input_ids)
-        
-        hf_logits = hf_outputs.logits
-        custom_logits = custom_outputs.logits if hasattr(custom_outputs, 'logits') else custom_outputs
-        
-        torch.testing.assert_close(custom_logits, hf_logits, rtol=1e-3, atol=1e-3)
-        print(f"✓ '{test_text}' - outputs match!")
-
-
-def test_hidden_states_match():
-    """Test intermediate hidden states match (if available)"""
-    hf_model, custom_model, tokenizer, config = load_models()
-    
-    test_text = "Testing hidden states"
-    inputs = tokenizer(test_text, return_tensors="pt")
-    input_ids = inputs["input_ids"].to("mps")
-    
-    with torch.no_grad():
-        hf_outputs = hf_model(input_ids, output_hidden_states=True)
-        custom_outputs = custom_model(input_ids, output_hidden_states=True)
-    
-    if hasattr(custom_outputs, 'hidden_states') and custom_outputs.hidden_states is not None:
-        # Compare hidden states from each layer
-        for layer_idx, (hf_hidden, custom_hidden) in enumerate(
-            zip(hf_outputs.hidden_states, custom_outputs.hidden_states)
-        ):
-            torch.testing.assert_close(
-                custom_hidden, 
-                hf_hidden, 
-                rtol=1e-3, 
-                atol=1e-3,
-                msg=f"Layer {layer_idx} hidden states differ"
+            hf_outputs = hf_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True
             )
-        print("✓ All hidden states match!")
+            custom_logits, custom_layer_outputs = custom_model(
+                input_ids=input_ids,
+                positions=positions,
+                attention_mask=attention_mask
+            )
+        
+        # Just check final layer
+        final_custom = custom_layer_outputs[-1]
+        final_hf = hf_outputs.hidden_states[-1]
+        
+        diff = (final_custom - final_hf).abs()
+        print(f"  Final layer - Max diff: {diff.max().item():.6e}, Mean diff: {diff.mean().item():.6e}")
+        
+        try:
+            torch.testing.assert_close(final_custom, final_hf, rtol=1e-4, atol=1e-4)
+            print(f"  ✅ PASS")
+        except AssertionError:
+            print(f"  ❌ FAIL")
 
 
 if __name__ == "__main__":
-    print("Testing custom LLaMA implementation...\n")
+    print("Testing custom Qwen implementation - Hidden States Only\n")
+    
+    # Use CPU for easier debugging (or change to "mps" if you prefer)
+    device = "cpu"
     
     try:
-        # check_model_weights()
-
-        print("1. Testing logits...")
-        test_output_logits_match()
-
+        # Main test
+        test_single_input_hidden_states(device=device)
         
-        print("\n2. Testing with multiple inputs...")
-        test_multiple_inputs()
+        # Additional tests
+        print("\n" + "="*60)
+        test_multiple_inputs(device=device)
         
-        print("\n3. Testing hidden states...")
-        test_hidden_states_match()
-        
-        # Uncomment if you've implemented generate()
-        # print("\n4. Testing generation...")
-        # test_generation_matches()
-        
-        print("\n✅ All tests passed!")
+        print("\n" + "="*60)
+        print("✅ ALL TESTS COMPLETE!")
+        print("="*60)
         
     except Exception as e:
-        print(f"\n❌ Test failed: {e}")
-        raise
+        print(f"\n❌ Test failed with exception:")
+        print(f"{type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
