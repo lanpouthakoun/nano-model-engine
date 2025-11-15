@@ -11,7 +11,9 @@ class RotaryEmbedding(nn.Module):
 
         self.config = config
 
-        base = config.rope_parameters["rope_theta"]
+    
+        print(config)
+        base = config.rope_theta
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
 
         self.attention_scaling = 1.0  # Unused in this type of RoPE

@@ -5,7 +5,42 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from InferenceModel.models.qwen import QwenForCausalLM
 
+hf_result_map = {}
+custom_result_map = {}
 
+def setup_hooks(model, result_map, model_name="model"):
+    """Attach hooks to a model and store results in result_map"""
+    hooks = []  # Store hook handles so you can remove them later
+    
+    for name, module in model.named_modules():
+        def make_hook(name, model_name):
+            def hook(module, inp, output):
+                full_name = f"{model_name}.{name}" if name else model_name
+                
+                # Handle input safely
+                if isinstance(inp, tuple):
+                    if len(inp) > 0:
+                        input_data = inp[0]
+                    else:
+                        input_data = None  # Empty tuple
+                else:
+                    input_data = inp
+                
+                result_map[full_name] = {
+                    "input": input_data,
+                    "output": output
+                }
+                
+                if hasattr(module, 'weight') and module.weight is not None:
+                    result_map[full_name]["weight"] = module.weight
+                if hasattr(module, 'bias') and module.bias is not None:
+                    result_map[full_name]["bias"] = module.bias
+            return hook
+        
+        handle = module.register_forward_hook(make_hook(name, model_name))
+        hooks.append(handle)
+    
+    return hooks
 def load_models(model_name: str = "Qwen/Qwen3-0.6B", device: str = "cpu"):
     """Load both HuggingFace and custom models"""
     print(f"Loading models on {device}...")
@@ -31,10 +66,24 @@ def load_models(model_name: str = "Qwen/Qwen3-0.6B", device: str = "cpu"):
     
     return hf_model, custom_model, tokenizer, config
 
+# Create separate result maps for each model
 
+
+# In your test function:
 def test_single_input_hidden_states(device: str = "cpu"):
     """Test that hidden states match for a single input"""
     hf_model, custom_model, tokenizer, _ = load_models(device=device)
+    
+    # Clear result maps
+    hf_result_map.clear()
+    custom_result_map.clear()
+    
+    # Attach hooks to both models
+    print("Setting up hooks...")
+    hf_hooks = setup_hooks(hf_model, hf_result_map, "hf")
+    custom_hooks = setup_hooks(custom_model, custom_result_map, "custom")
+    print(f"Attached {len(hf_hooks)} hooks to HF model")
+    print(f"Attached {len(custom_hooks)} hooks to custom model")
     
     # Simple test input
     test_text = "The quick brown fox jumps over the lazy dog"
@@ -63,22 +112,74 @@ def test_single_input_hidden_states(device: str = "cpu"):
         # Custom model forward
         custom_logits, custom_layer_outputs = custom_model(
             input_ids=input_ids,
-            positions=positions,
+            position_ids=positions,
             attention_mask=attention_mask
         )
     
-    # Compare embeddings (hidden_states[0] in HF)
+    # Now compare module outputs between the two models
     print("\n" + "="*60)
-    print("COMPARING EMBEDDINGS (Layer 0)")
+    print("COMPARING MODULE OUTPUTS (via hooks)")
     print("="*60)
-    hf_embeddings = hf_outputs.hidden_states[0]
-    # You might need to extract embeddings from your custom model differently
-    # For now assuming first layer output is after embeddings
     
-    print(f"HF embeddings shape: {hf_embeddings.shape}")
-    print(f"Custom has {len(custom_layer_outputs)} layer outputs")
+    # Find matching module names
+    hf_names = set(hf_result_map.keys())
+    custom_names = set(custom_result_map.keys())
     
-    # Compare layer by layer
+    # You might need to map names if they differ
+    # For example: "hf.model.layers.0.self_attn" -> "custom.layers.0.attention"
+    
+    print(f"\nHF model has {len(hf_names)} modules")
+    print(f"Custom model has {len(custom_names)} modules")
+    
+    # Compare matching modules (adjust name mapping as needed)
+    for hf_name in sorted(hf_names):
+        # Simple name mapping - adjust based on your architecture
+        custom_name = hf_name.replace("hf.", "custom.")
+        
+        if custom_name in custom_names:
+            hf_data = hf_result_map[hf_name]
+            custom_data = custom_result_map[custom_name]
+            
+            print(f"\n{'-'*60}")
+            print(f"Comparing: {hf_name.replace('hf.', '')}")
+            
+            # Compare outputs
+            if "output" in hf_data and "output" in custom_data:
+                hf_out = hf_data["output"]
+                custom_out = custom_data["output"]
+                
+                # Handle tuple outputs (some modules return tuples)
+                if isinstance(hf_out, tuple):
+                    hf_out = hf_out[0]
+                if isinstance(custom_out, tuple):
+                    custom_out = custom_out[0]
+                
+                if hasattr(hf_out, 'shape') and hasattr(custom_out, 'shape'):
+                    print(f"  Output shapes - HF: {hf_out.shape}, Custom: {custom_out.shape}")
+                    
+                    if hf_out.shape == custom_out.shape:
+                        diff = (hf_out - custom_out).abs()
+                        max_diff = diff.max().item()
+                        mean_diff = diff.mean().item()
+                        
+                        print(f"  Max diff: {max_diff:.6e}, Mean diff: {mean_diff:.6e}")
+                        
+                        try:
+                            torch.testing.assert_close(
+                                custom_out,
+                                hf_out,
+                                rtol=1e-4,
+                                atol=1e-4
+                            )
+                            print(f"  ✅ MATCH!")
+                        except AssertionError:
+                            print(f"  ❌ MISMATCH!")
+                            print(f"    Custom: min={custom_out.min():.6f}, max={custom_out.max():.6f}, mean={custom_out.mean():.6f}")
+                            print(f"    HF: min={hf_out.min():.6f}, max={hf_out.max():.6f}, mean={hf_out.mean():.6f}")
+                    else:
+                        print(f"  ⚠️ Shape mismatch!")
+    
+    # Compare layer outputs (your existing code)
     print("\n" + "="*60)
     print("COMPARING LAYER OUTPUTS")
     print("="*60)
@@ -87,13 +188,12 @@ def test_single_input_hidden_states(device: str = "cpu"):
     
     for i in range(num_layers):
         custom_hidden = custom_layer_outputs[i]
-        hf_hidden = hf_outputs.hidden_states[i + 1]  # +1 because hidden_states[0] is embeddings
+        hf_hidden = hf_outputs.hidden_states[i + 1]
         
         print(f"\nLayer {i}:")
         print(f"  Custom shape: {custom_hidden.shape}")
         print(f"  HF shape: {hf_hidden.shape}")
         
-        # Calculate differences
         diff = (custom_hidden - hf_hidden).abs()
         max_diff = diff.max().item()
         mean_diff = diff.mean().item()
@@ -101,7 +201,6 @@ def test_single_input_hidden_states(device: str = "cpu"):
         print(f"  Max difference: {max_diff:.6e}")
         print(f"  Mean difference: {mean_diff:.6e}")
         
-        # Check if they match
         try:
             torch.testing.assert_close(
                 custom_hidden,
@@ -112,18 +211,6 @@ def test_single_input_hidden_states(device: str = "cpu"):
             print(f"  ✅ Layer {i} MATCHES!")
         except AssertionError:
             print(f"  ❌ Layer {i} MISMATCH!")
-            
-            # Additional debugging info
-            print(f"\n  Debugging info:")
-            print(f"    Custom - min: {custom_hidden.min():.6f}, max: {custom_hidden.max():.6f}, mean: {custom_hidden.mean():.6f}")
-            print(f"    HF - min: {hf_hidden.min():.6f}, max: {hf_hidden.max():.6f}, mean: {hf_hidden.mean():.6f}")
-            
-            # Show where the largest differences are
-            max_diff_idx = diff.argmax()
-            max_diff_pos = torch.unravel_index(max_diff_idx, diff.shape)
-            print(f"    Largest diff at position: {max_diff_pos}")
-            print(f"    Custom value: {custom_hidden[max_diff_pos].item():.6f}")
-            print(f"    HF value: {hf_hidden[max_diff_pos].item():.6f}")
     
     # Compare final logits
     print("\n" + "="*60)
@@ -137,7 +224,14 @@ def test_single_input_hidden_states(device: str = "cpu"):
     diff = (custom_logits - hf_logits).abs()
     print(f"Max difference: {diff.max().item():.6e}")
     print(f"Mean difference: {diff.mean().item():.6e}")
-    
+    # In test function, after forward pass:
+    print(f"\nHook captured for model.layers.27:")
+    print(f"\nComparing layer 27:")
+    print(f"Custom layer_outputs[27]:")
+    print(f"  {custom_layer_outputs[27].min():.6f}, {custom_layer_outputs[27].mean():.6f}, {custom_layer_outputs[27].max():.6f}")
+    print(f"HF hidden_states[28]:")
+    hf_27 = hf_outputs.hidden_states[27]
+    print(f"  {hf_27.min():.6f}, {hf_27.mean():.6f}, {hf_27.max():.6f}")
     try:
         torch.testing.assert_close(
             custom_logits,
@@ -148,6 +242,12 @@ def test_single_input_hidden_states(device: str = "cpu"):
         print("✅ Final logits MATCH!")
     except AssertionError:
         print("❌ Final logits MISMATCH!")
+    
+    # Clean up hooks
+    for hook in hf_hooks + custom_hooks:
+        hook.remove()
+    
+    return hf_result_map, custom_result_map
 
 
 def test_multiple_inputs(device: str = "cpu"):
@@ -182,7 +282,7 @@ def test_multiple_inputs(device: str = "cpu"):
             )
             custom_logits, custom_layer_outputs = custom_model(
                 input_ids=input_ids,
-                positions=positions,
+                position_ids=positions,
                 attention_mask=attention_mask
             )
         

@@ -33,7 +33,7 @@ class QwenAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.attn = SimpleAttention(
+        self.self_attn = SimpleAttention(
             config.num_attention_heads,
             self.head_dim,
             self.scaling,
@@ -59,7 +59,7 @@ class QwenAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        attn_output, attn_weights = self.attn(
+        attn_output, attn_weights = self.self_attn(
             query_states,
             key_states,
             value_states,
@@ -73,18 +73,18 @@ class QwenAttention(nn.Module):
 class QwenDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.pre_layer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_layer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = MLP(config)
-        self.attention = QwenAttention(config, layer_idx)
+        self.self_attn = QwenAttention(config, layer_idx)
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None):
         r_1 = hidden_states
-        hidden_states = self.pre_layer_norm(hidden_states)
-        hidden_states, _ = self.attention(hidden_states, position_embeddings, attention_mask)
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(hidden_states, position_embeddings, attention_mask)
         hidden_states = r_1 + hidden_states
         r_2 = hidden_states
-        hidden_states = self.post_layer_norm(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states + r_2
@@ -110,15 +110,21 @@ class QwenModel(nn.Module):
         
         layer_outputs = []  # ✅ Add this
         
-        for decoder_layer in self.layers:
+        for idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
             )
-            layer_outputs.append(hidden_states)  # ✅ Collect each layer
-        
+            if idx == 27:
+                    print(f"Layer 27 output being stored:")
+                    print(f"  Shape: {hidden_states.shape}")
+                    print(f"  Min: {hidden_states.min():.6f}, Max: {hidden_states.max():.6f}")
+                    print(f"  Mean: {hidden_states.mean():.6f}")
+                
+            layer_outputs.append(hidden_states)
         hidden_states = self.norm(hidden_states)
+        layer_outputs[-1] = hidden_states
         return hidden_states, layer_outputs  # ✅ Return both
     
 class QwenForCausalLM(nn.Module):
