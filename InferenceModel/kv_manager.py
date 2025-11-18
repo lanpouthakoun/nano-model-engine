@@ -21,6 +21,9 @@ class KVCacheManager(ABC):
     def can_allocate(self):
         pass
 
+    def allocate_decode(self, request):
+        pass
+
     @abstractmethod
     def can_run(self):
         pass

@@ -53,8 +53,7 @@ class SimpleAttention(nn.Module):
 
         attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * self.scale
         
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len))  # Lower triangular
-        # Apply mask: set upper triangle to -inf
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len))
         attn_weights = attn_weights.masked_fill(causal_mask == 0, float('-inf'))
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
@@ -84,11 +83,9 @@ def create_causal_mask(
     Returns:
         4D mask of shape (batch_size, 1, seq_length, seq_length) with 0s where attention is allowed, -inf where masked
     """
-    # Create basic causal mask (lower triangular)
     causal_mask = torch.ones(seq_length, seq_length, dtype=torch.bool, device=device)
-    causal_mask = torch.triu(causal_mask, diagonal=1)  # Upper triangle = True (masked)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
     
-    # Convert to additive mask: False (attend) -> 0.0, True (mask) -> -inf
     min_dtype = torch.finfo(dtype).min
     causal_mask = torch.where(
         causal_mask, 
@@ -96,20 +93,13 @@ def create_causal_mask(
         torch.tensor(0.0, dtype=dtype, device=device)
     )
     
-    # Expand to 4D: (1, 1, seq_length, seq_length)
     causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
     
-    # Handle padding mask if provided
     if attention_mask is not None:
-        # attention_mask is (batch_size, seq_length) with 1s for valid, 0s for padding
-        # Expand to (batch_size, 1, 1, seq_length)
         padding_mask = attention_mask.unsqueeze(1).unsqueeze(2).to(dtype=dtype, device=device)
-        # Convert to additive mask: 0 (padding) -> -inf, 1 (valid) -> 0
         padding_mask = (1.0 - padding_mask) * min_dtype
-        # Broadcast and combine with causal mask
         causal_mask = causal_mask.expand(batch_size, 1, seq_length, seq_length) + padding_mask
     else:
-        # Just expand to batch size
         causal_mask = causal_mask.expand(batch_size, 1, seq_length, seq_length)
     
     return causal_mask

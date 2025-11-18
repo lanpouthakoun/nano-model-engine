@@ -7,7 +7,7 @@ class Scheduler:
     def __init__(self, cache_manager, max_batch_size, eos = None, block_size = 32):
         self.KVCacheManager = PagedAttentionManager(block_size)
         self.waiting = deque()
-        self.running = []
+        self.running = deque()
         self.max_batch_size = max_batch_size
         self.eos = eos # End of String Token
 
@@ -25,41 +25,46 @@ class Scheduler:
         This function decides what to run at this specific iteration, it decides when to allocate requests (move from waiting to running)
         """
         num_requests = 0
-        resulting_requests = []
-        # need an organize function for RADIX
-
+        current_step = []
+        # we want to prioritize getting some outputs at least, so prioritize maximizing batch_size always
         while self.waiting and num_requests < self.max_batch_size:
-            request = self.waiting[0]
-            if not self.KVCacheManager.can_allocate(request):
+            # We want to add all requests from the waiting to the runnign queue
+            if not self.KVCacheManager.can_allocate(self.waiting[0]):
                 break
+            request = self.waiting.popleft()
+            blocks = self.KVCacheManager.allocate(request)
             num_requests += 1
-            self.KVCacheManager.allocate(request)
-            # check here if we can even process this request
-
-            request.set_status("RUNNING")
-            self.waiting.popleft()
+            request.prefill_blocks(blocks)
             self.running.append(request)
-            resulting_requests.append(request)
+            current_step.append(request)
+        if current_step: # we want to only run prefill requests together
+            return current_step, True
         
-        if resulting_requests:
-            # this means we have things to prefill
-            return resulting_requests, True
-    
+        # Here, we decode
+
         while self.running and num_requests < self.max_batch_size:
-            req = self.running.popleft()
-            while not self.KVCacheManager.can_run(req): #were in a queue, so we want the front one to run the most
+            request = self.running.popleft()
+            while not self.KVCacheManager.can_allocate(request): # can we even decode this request?
+                # if not, preempt other requests
                 if self.running:
-                    self.preempt(self.running.pop())
+                    self.preempt(self.running.popleft())
                 else:
-                    self.preempt(req)
+                    self.preempt(request)
                     break
             else:
-                resulting_requests.append(req)
+                self.KVCacheManager.allocate_decode(request)
                 num_requests += 1
+                current_step.append(request)
+        for i in current_step:
+            self.running.append(i)
+        return current_step, False
 
-        return resulting_requests, False
     
     def preempt(self, req: Request):
+        """
+        We were generating this request, but we no longer have space,
+        make this a waiting request again and come back to it next up
+        """
         req.set_status() = "WAITING"
         self.KVCacheManager.free(req)
         self.waiting.appendleft(req)
