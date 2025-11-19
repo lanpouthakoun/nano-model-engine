@@ -79,6 +79,6 @@ class Scheduler:
         for request, token in zip(requests, new_tokens):
             request.add_token(token)
             if token == self.eos or request.num_tokens == self.max_tokens:
-                request.status = "FINISHED"
-                self.KVCacheManager.deallocate(request)
+                request.status = "COMPLETE"
+                self.KVCacheManager.free(request)
                 self.running.remove(request)
